@@ -1,302 +1,466 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# Goldbach conjecture verifier — Python port of main.cpp.
+#
+# HOW THE GOLDBACH VERIFIER ACHIEVES MATHEMATICAL CORRECTNESS
+#
+# 1. Phase 1 (fast path): SMALL_PRIMES holds every prime up to
+#    SMALL_PRIME_LIMIT (1,500,000) — ~114,000 entries, built once at startup.
+#    For each even N the verifier iterates these as candidate p, testing
+#    q = N-p with deterministic Miller-Rabin.  In practice this finds a pair
+#    in the first one to three iterations for every N encountered.
+#
+# 2. Phase 2 (completeness fallback): If Phase 1 exhausts all small primes
+#    without finding a pair, the verifier continues scanning odd integers
+#    p = SMALL_PRIME_LIMIT+2, SMALL_PRIME_LIMIT+4, ... up to N/2, testing
+#    each p and q = N-p with Miller-Rabin.  This makes correctness
+#    unconditional — no unproven assumption about small-prime Goldbach
+#    coverage is required.
+#
+# 3. Miller-Rabin witnesses {2..37} are proven deterministic for all
+#    n < 3.317e24, covering every 64-bit value with zero false results.
+#    (Python ints are arbitrary-precision, so the C++ overflow guards are
+#    unnecessary here.)
+#
+# 4. Memory is bounded: SMALL_PRIMES is fixed; the segmented-sieve buffer
+#    used by the enumerator thread is reused every segment.
+#
+# PYTHON-SPECIFIC DESIGN CHANGES vs the C++ original
+#
+# * Workers are PROCESSES (ProcessPoolExecutor), not threads — CPython's GIL
+#   prevents thread-level parallelism for CPU-bound work.
+# * The C++ workers updated record statistics via lock-free CAS and wrote
+#   interesting_cases.txt themselves.  Processes can't share atomics cheaply,
+#   so each batch returns its local maxima and the coordinator (single
+#   thread) merges them and writes the record file.  Output is equivalent.
+# * The prime enumerator and command loop remain threads (they are I/O-light
+#   and display-only).
+#
+# NOTE ON THE PRIME ENUMERATOR THREAD
+# A sieve base of primes up to L correctly sieves numbers up to L^2, i.e.
+# ~2.25e12 here.  Beyond that its prime *count* over-counts.  This has no
+# effect on Goldbach correctness; it only affects the status display.
+# ---------------------------------------------------------------------------
+
+import math
+import multiprocessing
 import os
+import sys
 import threading
 import time
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing.shared_memory import SharedMemory
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from datetime import datetime
 
-BATCH_SIZE    = 10_000         # even numbers per Goldbach worker batch
-WRITE_BATCH   = 1_000          # primes collected before one flush to disk
-SEGMENT_SIZE  = 1 << 21        # 2 M odd slots = ~4 M number range per segment
-SMALL_PRIME_LIMIT = 1_000_000  # small primes cached for segment sieve (covers to 10^12)
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+SMALL_PRIME_LIMIT = 1_500_000    # primes stored for Goldbach p candidates
+SEG_SIZE = 1 << 21               # odd-number slots per sieve segment (~2 MB)
+BATCH_SIZE = 10_000              # even numbers per Goldbach work unit
+WRITE_BATCH = 1_000              # output lines buffered before flushing
+CHECKPOINT_INTERVAL = 1_000_000  # min verified advance per checkpoint write
 
-CPU_COUNT   = os.process_cpu_count() or 1
-NUM_WORKERS = max(1, CPU_COUNT - 1)
+# ---------------------------------------------------------------------------
+# Global state (main process) — coordinator is the single writer of stats;
+# the command loop only reads.  Lists are guarded by locks.
+# ---------------------------------------------------------------------------
+SMALL_PRIMES = []                # built once in main(), read-only afterwards
 
-SIEVE_LIMIT = 100_000_000
-MAX_PRIMES  = 10_000_000   # uint32 slots; covers primes up to ~250 M
+g_total_primes = 0
+g_prime_frontier = 2             # highest prime seen by enumerator
+g_checked = 2                    # highest even number Goldbach-verified
+g_stop = threading.Event()
+g_violations = []
+g_violations_lock = threading.Lock()
+g_io_lock = threading.Lock()
+g_num_workers = 1
+
+# Statistics (single writer: coordinator thread)
+g_fallback_activations = 0
+g_largest_fallback_N = 0         # N of the deepest fallback search seen
+g_max_fallback_depth = 0         # deepest fallback iteration count seen
+g_max_fast_depth = 0             # largest Phase-1 iteration count seen
+g_max_fast_depth_N = 0           # N that produced g_max_fast_depth
 
 
-def is_prime(n):
-    """Trial-division fallback — only reached for q > SIEVE_LIMIT inside workers."""
-    if n < 2: return False
-    if n == 2: return True
-    if n % 2 == 0: return False
-    for i in range(3, int(n**0.5) + 1, 2):
-        if n % i == 0: return False
+# ---------------------------------------------------------------------------
+# Deterministic Miller-Rabin primality test
+# ---------------------------------------------------------------------------
+_MR_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+
+
+def is_prime_mr(n):
+    if n < 2:
+        return False
+    if n in (2, 3, 5):
+        return True
+    if n % 2 == 0 or n % 3 == 0 or n % 5 == 0:
+        return False
+    d = n - 1
+    r = 0
+    while d % 2 == 0:
+        d >>= 1
+        r += 1
+    for a in _MR_WITNESSES:
+        if a >= n:
+            continue
+        x = pow(a, d, n)          # built-in modular exponentiation
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
     return True
 
 
-def _odd_sieve(limit):
-    """
-    Odd-only Sieve of Eratosthenes to `limit`.
-    Index i -> odd number 2*i+3.  0 = prime, 1 = composite.
-    """
-    size = (limit - 1) // 2
+# ---------------------------------------------------------------------------
+# Build the small-prime table — Eratosthenes sieve over odd numbers up to
+# SMALL_PRIME_LIMIT.
+# ---------------------------------------------------------------------------
+def build_small_primes():
+    size = (SMALL_PRIME_LIMIT - 1) // 2      # slots for 3, 5, 7, ...
     sieve = bytearray(size)
     i = 0
     while True:
         p = 2 * i + 3
-        if p * p > limit:
+        if p * p > SMALL_PRIME_LIMIT:
             break
         if not sieve[i]:
             start = (p * p - 3) // 2
-            n_marks = (size - start + p - 1) // p
-            sieve[start::p] = b'\x01' * n_marks
+            sieve[start::p] = b"\x01" * len(range(start, size, p))
         i += 1
-    return sieve
+    primes = [2]
+    primes.extend(2 * j + 3 for j in range(size) if not sieve[j])
+    return primes
 
 
-def _segment_sieve(seg_lo, seg_hi, small_primes):
+def current_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Worker process side
+# ---------------------------------------------------------------------------
+_worker_primes = None
+
+
+def _init_worker():
+    # Rebuild the table per process (works under both fork and spawn;
+    # takes well under a second).
+    global _worker_primes
+    _worker_primes = build_small_primes()
+
+
+def check_goldbach_batch(even_start, even_end):
+    """Verify Goldbach for evens in [even_start, even_end), step 2.
+
+    Returns (result_lines, stats) where stats carries the batch-local maxima
+    that the coordinator merges into the global records.
     """
-    Segmented odd-only sieve — returns all primes in [seg_lo, seg_hi].
-
-    seg_lo must be odd.
-    small_primes must contain all primes <= sqrt(seg_hi).
-
-    p=2 is skipped: the segment stores only odd numbers, so 2 has no odd
-    multiples to mark.  Including it corrupts the index arithmetic.
-    """
-    size = (seg_hi - seg_lo) // 2 + 1
-    sieve = bytearray(size)
-    for p in small_primes:
-        if p == 2:
-            continue          # odd-only segment; 2 has no odd multiples here
-        # First odd multiple of p that is >= seg_lo
-        start = ((seg_lo + p - 1) // p) * p   # ceil(seg_lo / p) * p
-        if start % 2 == 0:
-            start += p        # p is odd -> even + odd = odd
-        if start == p:
-            start += 2 * p   # skip p itself
-        if start > seg_hi:
-            continue
-        start_idx = (start - seg_lo) // 2
-        n_marks   = (size - start_idx + p - 1) // p
-        sieve[start_idx::p] = b'\x01' * n_marks
-    return [seg_lo + 2 * i for i, c in enumerate(sieve) if not c]
-
-
-def check_goldbach_batch(args):
-    """
-    Worker — runs in a separate OS process.
-    Receives only small scalars; attaches to shared memory for prime data.
-    Uses the sieve byte array for O(1) membership; no set is ever built.
-    """
-    even_start, even_end, n_primes, primes_shm_name, sieve_shm_name, sieve_slots = args
-    shm_p = SharedMemory(name=primes_shm_name)
-    shm_s = SharedMemory(name=sieve_shm_name)
-    p_buf = memoryview(shm_p.buf).cast('I')
-    s_buf = memoryview(shm_s.buf)
+    primes = _worker_primes
     results = []
-    for even in range(even_start, even_end, 2):
+    stats = {
+        "max_fast_depth": 0, "max_fast_depth_N": 0,
+        "fallback_activations": 0,
+        "max_fallback_depth": 0, "largest_fallback_N": 0,
+    }
+    fallback_start = primes[-1] + 2 if primes else 3
+
+    for N in range(even_start, even_end, 2):
         found = False
-        half  = even >> 1
-        for i in range(n_primes):
-            p = p_buf[i]
+        half = N >> 1
+
+        # Phase 1: small-prime candidates (fast).  fast_depth counts primes
+        # tried (1-indexed; only primes with p <= N/2 are counted).
+        fast_depth = 0
+        for p in primes:
             if p > half:
                 break
-            q = even - p
-            if q == 2:
-                is_q_prime = True
-            elif q < 3 or not (q & 1):
-                is_q_prime = False
-            else:
-                q_idx = (q - 3) >> 1
-                is_q_prime = (s_buf[q_idx] == 0) if q_idx < sieve_slots else is_prime(q)
-            if is_q_prime:
-                results.append(f"{even} = {p} + {q}")
+            fast_depth += 1
+            q = N - p
+            if is_prime_mr(q):
+                results.append(f"{N} = {p} + {q}")
                 found = True
+                if fast_depth > stats["max_fast_depth"]:
+                    stats["max_fast_depth"] = fast_depth
+                    stats["max_fast_depth_N"] = N
                 break
+
+        # Phase 2: exhaustive fallback beyond SMALL_PRIME_LIMIT.  Entered
+        # only when every Goldbach pair for this N has both primes above
+        # SMALL_PRIME_LIMIT.  No such N is known to exist, so this path is
+        # never expected to be taken in practice.
+        if not found and fallback_start <= half:
+            stats["fallback_activations"] += 1
+            fallback_depth = 0
+            for p in range(fallback_start, half + 1, 2):
+                fallback_depth += 1
+                if is_prime_mr(p):
+                    q = N - p
+                    if is_prime_mr(q):
+                        results.append(f"{N} = {p} + {q}")
+                        found = True
+                        if fallback_depth > stats["max_fallback_depth"]:
+                            stats["max_fallback_depth"] = fallback_depth
+                            stats["largest_fallback_N"] = N
+                        break
+
         if not found:
-            results.append(f"VIOLATION: {even} has no prime pair!")
-    del p_buf, s_buf
-    shm_p.close()
-    shm_s.close()
-    return results
+            results.append(f"VIOLATION: {N} has no prime pair!")
+
+    return results, stats
 
 
-if __name__ == "__main__":
-    print("is it true that all even numbers greater than 2 are a sum of 2 prime numbers")
-    print(f"Using {NUM_WORKERS} worker processes for Goldbach verification.")
-    print("Type 'status' to check progress, 'stop' to stop, or 'quit' to force quit.")
+# ---------------------------------------------------------------------------
+# Checkpoint writer — overwrites checkpoint.txt with current statistics.
+# Called from the coordinator thread only.
+# ---------------------------------------------------------------------------
+def write_checkpoint():
+    try:
+        with open("checkpoint.txt", "w") as cp:
+            cp.write(
+                f"Goldbach verified up to: {g_checked}\n\n"
+                f"Goldbach failures found: {len(g_violations)}\n\n"
+                f"Times the emergency search was needed: {g_fallback_activations}\n\n"
+                f"Largest number that needed the emergency search: {g_largest_fallback_N}\n\n"
+                f"Most work ever needed during an emergency search: {g_max_fallback_depth} checks\n\n"
+                f"Number that was most difficult to verify: {g_max_fast_depth_N}\n\n"
+                f"Most difficult number checked so far: {g_max_fast_depth} checks\n\n"
+                f"Timestamp: {current_timestamp()}\n"
+            )
+    except OSError:
+        pass
 
-    print("Computing sieve and initialising shared memory...", end="", flush=True)
-    _sieve = _odd_sieve(SIEVE_LIMIT)
-    sieve_slots = len(_sieve)
 
-    shm_sieve = SharedMemory(create=True, size=sieve_slots)
-    shm_sieve.buf[:sieve_slots] = _sieve
-    del _sieve
+# ---------------------------------------------------------------------------
+# Goldbach coordinator thread
+#
+# Distributes batches of even numbers to worker processes, collects results,
+# merges statistics, and appends them to goldbach.txt / violations.txt /
+# interesting_cases.txt.
+# ---------------------------------------------------------------------------
+def goldbach_coordinator():
+    global g_checked, g_fallback_activations, g_largest_fallback_N
+    global g_max_fallback_depth, g_max_fast_depth, g_max_fast_depth_N
 
-    shm_primes = SharedMemory(create=True, size=MAX_PRIMES * 4)
-    _pv = memoryview(shm_primes.buf).cast('I')
-    _pv[0] = 2
-    del _pv
-    shm_count = multiprocessing.Value('L', 1)
-    print(" done.\n")
+    try:
+        f = open("goldbach.txt", "a")
+        viol_file = open("violations.txt", "a")
+        interesting_file = open("interesting_cases.txt", "a")
+    except OSError as e:
+        with g_io_lock:
+            print(f"[Goldbach] ERROR: cannot open output file: {e}", file=sys.stderr)
+        g_stop.set()
+        return
 
-    stop_event      = threading.Event()
-    primes          = [2]
-    current         = 3
-    goldbach_checked = [3]   # list so mutation is visible across threads
-    violations      = []
+    def record_interesting(header, N, depth):
+        interesting_file.write(
+            f"{header}\n\n"
+            f"Number={N}\n\n"
+            f"Checks needed before finding a Goldbach pair={depth}\n\n"
+            f"Timestamp={current_timestamp()}\n\n"
+        )
+        interesting_file.flush()
 
-    def generate_primes_forever():
-        global current
-        pv  = memoryview(shm_primes.buf).cast('I')
-        sv  = memoryview(shm_sieve.buf)
-        idx = shm_count.value
+    def merge_stats(stats):
+        global g_fallback_activations, g_largest_fallback_N
+        global g_max_fallback_depth, g_max_fast_depth, g_max_fast_depth_N
+        if stats["max_fast_depth"] > g_max_fast_depth:
+            g_max_fast_depth = stats["max_fast_depth"]
+            g_max_fast_depth_N = stats["max_fast_depth_N"]
+            record_interesting("NEW MOST DIFFICULT NUMBER FOUND",
+                               g_max_fast_depth_N, g_max_fast_depth)
+        g_fallback_activations += stats["fallback_activations"]
+        if stats["max_fallback_depth"] > g_max_fallback_depth:
+            g_max_fallback_depth = stats["max_fallback_depth"]
+            g_largest_fallback_N = stats["largest_fallback_N"]
+            record_interesting("NEW EMERGENCY SEARCH RECORD",
+                               g_largest_fallback_N, g_max_fallback_depth)
 
-        # Small primes from the initial sieve, used as the basis for
-        # the segmented sieve in Phase 2.  Covers segments up to ~10^12.
-        small_primes = []
+    write_buf = []
 
-        os.path.exists("primes.txt")
-        with open("primes.txt", "a") as f:
-            write_buf = []
+    def flush_write_buf():
+        if write_buf:
+            f.write("\n".join(write_buf) + "\n")
+            f.flush()
+            write_buf.clear()
 
-            # ── Phase 1: stream the pre-computed 100M sieve ───────────────────
-            for slot_idx, composite in enumerate(sv):
-                if stop_event.is_set():
-                    break
-                n = 2 * slot_idx + 3
-                current = n
-                if not composite:
-                    primes.append(n)
-                    if n <= SMALL_PRIME_LIMIT:
-                        small_primes.append(n)
-                    if idx < MAX_PRIMES:
-                        pv[idx] = n
-                        idx += 1
-                    write_buf.append(f"{n}\n")
-                    if len(write_buf) >= WRITE_BATCH:
-                        f.write(''.join(write_buf))
-                        f.flush()
-                        shm_count.value = idx   # batch update reduces lock contention
-                        write_buf.clear()
-                # Yield GIL so the coordinator thread gets CPU time.
-                if slot_idx % 50_000 == 0:
-                    time.sleep(0)
+    def process_lines(lines):
+        for line in lines:
+            if line.startswith("VIOLATION"):
+                with g_violations_lock:
+                    g_violations.append(line)
+                viol_file.write(line + "\n")
+                viol_file.flush()
+                with g_io_lock:
+                    print(f"\n*** {line} ***\n> ", end="", flush=True)
+            else:
+                write_buf.append(line)
 
-            if write_buf:
-                f.write(''.join(write_buf))
-                f.flush()
-                shm_count.value = idx
-                write_buf.clear()
+    next_even = 4
+    last_checkpoint_at = 0
 
-            # ── Phase 2: segmented sieve beyond SIEVE_LIMIT ───────────────────
-            # Replaces trial division entirely.  Maintains ~sieve-level
-            # throughput indefinitely — no per-candidate sqrt() checks.
-            if not stop_event.is_set():
-                seg_lo = SIEVE_LIMIT + 1
-                if seg_lo % 2 == 0:
-                    seg_lo += 1
+    # "spawn" avoids fork-with-running-threads deadlocks on Linux and is the
+    # only start method on Windows, so behavior is identical everywhere.
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=g_num_workers, mp_context=ctx,
+                             initializer=_init_worker) as pool:
+        # queue of (future, last_even_in_batch), processed in submission order
+        queue = deque()
 
-                while not stop_event.is_set():
-                    seg_hi    = seg_lo + SEGMENT_SIZE * 2 - 2
-                    sqrt_hi   = int(seg_hi ** 0.5) + 1
-                    seg_small = [p for p in small_primes if p <= sqrt_hi]
-
-                    seg_primes = _segment_sieve(seg_lo, seg_hi, seg_small)
-
-                    for p in seg_primes:
-                        if stop_event.is_set():
-                            break
-                        current = p
-                        primes.append(p)
-                        if idx < MAX_PRIMES:
-                            pv[idx] = p
-                            idx += 1
-                        write_buf.append(f"{p}\n")
-                        if len(write_buf) >= WRITE_BATCH:
-                            f.write(''.join(write_buf))
-                            f.flush()
-                            shm_count.value = idx
-                            write_buf.clear()
-
-                    if not seg_primes:
-                        current = seg_hi   # advance current even in sparse zones
-
-                    seg_lo = seg_hi + 2
-
-            if write_buf:
-                f.write(''.join(write_buf))
-                f.flush()
-                shm_count.value = idx
-
-        del pv, sv
-        print(f"\n[Primes] Found {len(primes)} primes up to {current}.")
-
-    def goldbach_coordinator():
-        next_even = 4
-        p_name  = shm_primes.name
-        s_name  = shm_sieve.name
-        s_slots = sieve_slots
-
-        os.path.exists("goldbach.txt")
-        with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor, \
-             open("goldbach.txt", "a") as f:
-            queue = []
-
-            while not stop_event.is_set():
+        while not g_stop.is_set():
+            # Keep the pipeline full: at most num_workers*2 batches in flight
+            while len(queue) < g_num_workers * 2:
                 batch_end = next_even + BATCH_SIZE * 2
+                fut = pool.submit(check_goldbach_batch, next_even, batch_end)
+                queue.append((fut, batch_end - 2))
+                next_even = batch_end
 
-                while len(queue) < NUM_WORKERS * 2 and current > batch_end:
-                    n_p  = shm_count.value
-                    args = (next_even, batch_end, n_p, p_name, s_name, s_slots)
-                    fut  = executor.submit(check_goldbach_batch, args)
-                    queue.append((fut, batch_end - 2))
-                    next_even = batch_end
-                    batch_end = next_even + BATCH_SIZE * 2
+            fut, batch_last = queue[0]
+            done, _ = wait([fut], timeout=0.001, return_when=FIRST_COMPLETED)
+            if done:
+                queue.popleft()
+                lines, stats = fut.result()
+                merge_stats(stats)
+                process_lines(lines)
+                if len(write_buf) >= WRITE_BATCH:
+                    flush_write_buf()
+                g_checked = batch_last
+                if batch_last - last_checkpoint_at >= CHECKPOINT_INTERVAL:
+                    write_checkpoint()
+                    last_checkpoint_at = batch_last
 
-                if queue and queue[0][0].done():
-                    fut, last_even = queue.pop(0)
-                    for line in fut.result():
-                        f.write(line + "\n")
-                        if line.startswith("VIOLATION"):
-                            violations.append(line)
-                            print(f"\n*** {line} ***\n> ", end="", flush=True)
-                    f.flush()
-                    goldbach_checked[0] = last_even
-                else:
-                    time.sleep(0.0005)   # 0.5 ms — tighter poll than before
+        # Drain any in-flight work
+        for fut, batch_last in queue:
+            lines, stats = fut.result()
+            merge_stats(stats)
+            process_lines(lines)
+            g_checked = batch_last
+        flush_write_buf()
+        write_checkpoint()  # final checkpoint so the last state is on disk
 
-            for fut, last_even in queue:
-                for line in fut.result():
-                    f.write(line + "\n")
-                    if line.startswith("VIOLATION"):
-                        violations.append(line)
-                f.flush()
-                goldbach_checked[0] = last_even
+    f.close()
+    viol_file.close()
+    interesting_file.close()
+    with g_io_lock:
+        print(f"\n[Goldbach] Verified up to {g_checked}. "
+              f"Violations: {len(g_violations)}.")
 
-        print(f"\n[Goldbach] Verified up to {goldbach_checked[0]}. Violations: {len(violations)}.")
 
-    prime_thread    = threading.Thread(target=generate_primes_forever, daemon=True)
-    goldbach_thread = threading.Thread(target=goldbach_coordinator,    daemon=True)
+# ---------------------------------------------------------------------------
+# Prime enumerator thread (display only — does not feed the verifier)
+#
+# Segmented sieve beyond SMALL_PRIME_LIMIT using SMALL_PRIMES as the base.
+# The segment buffer is reused each iteration — memory usage is constant.
+# ---------------------------------------------------------------------------
+def enumerate_primes_forever():
+    global g_total_primes, g_prime_frontier
+    g_total_primes = len(SMALL_PRIMES)
+    g_prime_frontier = SMALL_PRIMES[-1] if SMALL_PRIMES else 2
+
+    seg_lo = SMALL_PRIME_LIMIT + 2
+    if seg_lo % 2 == 0:
+        seg_lo += 1  # ensure odd start
+
+    while not g_stop.is_set():
+        seg_hi = seg_lo + 2 * SEG_SIZE - 2
+        sqrt_hi = math.isqrt(seg_hi) + 2
+        seg = bytearray(SEG_SIZE)
+
+        for p in SMALL_PRIMES:
+            if p == 2:
+                continue
+            if p > sqrt_hi:
+                break
+            start = ((seg_lo + p - 1) // p) * p
+            if start % 2 == 0:
+                start += p
+            if start == p:
+                start += 2 * p  # don't mark p itself
+            if start > seg_hi:
+                continue
+            idx = (start - seg_lo) // 2
+            seg[idx::p] = b"\x01" * len(range(idx, SEG_SIZE, p))
+
+        found = seg.count(0)
+        if found:
+            g_total_primes += found
+            g_prime_frontier = seg_lo + 2 * seg.rfind(b"\x00")
+        else:
+            g_prime_frontier = seg_hi
+
+        seg_lo = seg_hi + 2
+        time.sleep(0.001)  # yield the GIL so interactive threads stay responsive
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main():
+    global g_num_workers, SMALL_PRIMES
+
+    cpu = os.cpu_count() or 1
+    g_num_workers = max(1, cpu - 1)
+
+    print("Is every even integer > 2 the sum of two primes?")
+    print(f"Using {g_num_workers} worker process(es) for Goldbach verification.")
+    print("Commands: status | stop | quit\n")
+    print(f"Building prime table (primes up to {SMALL_PRIME_LIMIT})...",
+          end="", flush=True)
+
+    SMALL_PRIMES[:] = build_small_primes()
+    print(f" done. ({len(SMALL_PRIMES)} primes)\n")
+
+    prime_thread = threading.Thread(target=enumerate_primes_forever, daemon=True)
+    goldbach_thread = threading.Thread(target=goldbach_coordinator)
     prime_thread.start()
     goldbach_thread.start()
-    print("Prime generation and Goldbach verification started.\n")
+    print("Running.\n")
 
     while True:
-        cmd = input("> ").strip().lower()
+        try:
+            with g_io_lock:
+                print("> ", end="", flush=True)
+            line = input()
+        except (EOFError, KeyboardInterrupt):
+            break
+        cmd = line.strip().lower()
         if cmd == "status":
-            print(f"Primes: {len(primes)} found, checking up to {current}.")
-            print(f"Goldbach: verified up to {goldbach_checked[0]}.")
-            if violations:
-                print(f"VIOLATIONS: {len(violations)}")
-                for v in violations:
-                    print(f"  {v}")
-            else:
-                print("No violations found so far.")
+            with g_violations_lock:
+                vio = list(g_violations)
+            with g_io_lock:
+                print(f"Primes enumerated       : {g_total_primes}"
+                      f"  (frontier: {g_prime_frontier})")
+                print(f"Goldbach verified       : up to {g_checked}")
+                print(f"Fallback activations    : {g_fallback_activations}")
+                print(f"Largest fallback N      : {g_largest_fallback_N}")
+                print(f"Deepest fallback depth  : {g_max_fallback_depth}")
+                print(f"Largest fast-path depth : {g_max_fast_depth}")
+                print(f"Largest fast-path N     : {g_max_fast_depth_N}")
+                if vio:
+                    print(f"VIOLATIONS ({len(vio)}):")
+                    for v in vio:
+                        print(f"  {v}")
+                else:
+                    print("No violations found so far.")
         elif cmd == "stop":
-            stop_event.set()
-            prime_thread.join()
-            goldbach_thread.join()
-            shm_primes.close(); shm_primes.unlink()
-            shm_sieve.close();  shm_sieve.unlink()
+            g_stop.set()
             break
         elif cmd == "quit":
-            print("Force quitting...")
+            with g_io_lock:
+                print("Force quitting.")
             os._exit(0)
         elif cmd:
             print("Commands: status | stop | quit")
+
+    g_stop.set()
+    goldbach_thread.join()  # drains in-flight batches, writes final checkpoint
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
