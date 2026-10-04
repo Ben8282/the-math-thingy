@@ -1,0 +1,9 @@
+goldbach
+goldbach.exe
+*.o
+*.obj
+checkpoint.txt
+checkpoint.tmp
+interesting_cases.txt
+violations.txt
+goldbach.txt
